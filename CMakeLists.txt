@@ -302,3 +302,7 @@ set(EXTERNALS_FMT_PATH
 # ############################### Compiling targets ##################################################################
 
 add_subdirectory(EnvironmentSimulator)
+
+if(USE_OSG)
+    add_subdirectory(gltf-exporter)
+endif()
