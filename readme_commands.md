@@ -1,0 +1,2 @@
+cmake --build build --target export_odr_to_gltf -> to build
+cd build/gltf-exporter && ./export_odr_to_gltf /Users/jesper/Downloads/esmini-master/resources/xodr/curve_r100.xodr test_curve.glb  -> build glb

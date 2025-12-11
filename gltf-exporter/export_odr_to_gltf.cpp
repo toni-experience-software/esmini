@@ -35,6 +35,8 @@
 #include <osg/StateSet>
 #include <osg/Material>
 #include <osg/LineWidth>
+#include <osg/Texture2D>
+#include <osg/Image>
 
 using namespace tinygltf;
 
@@ -248,6 +250,8 @@ private:
     int _defaultMaterialIndex;
     std::vector<osg::Matrix> _matrixStack;
     std::map<std::string, int> _materialCache; // Cache for materials
+    std::map<std::string, int> _imageCache; // Cache for images
+    std::map<std::string, int> _textureCache; // Cache for textures
     
     void pushMatrix(const osg::Matrix& matrix) {
         if (_matrixStack.empty()) {
@@ -276,27 +280,136 @@ private:
     };
 
     MaterialInfo getOrCreateMaterial(osg::StateSet* ss) {
-        if (!ss) return {_defaultMaterialIndex, false, "OPAQUE", false};
+        if (!ss) {
+            // std::cout << "[DEBUG] No StateSet" << std::endl; 
+            return {_defaultMaterialIndex, false, "OPAQUE", false};
+        }
 
         osg::Material* mat = dynamic_cast<osg::Material*>(ss->getAttribute(osg::StateAttribute::MATERIAL));
-        if (!mat) return {_defaultMaterialIndex, false, "OPAQUE", false};
+        if (!mat) {
+            // std::cout << "[DEBUG] No osg::Material" << std::endl;
+            return {_defaultMaterialIndex, false, "OPAQUE", false};
+        }
 
         osg::Vec4 diffuse = mat->getDiffuse(osg::Material::FRONT);
         float alpha = diffuse.a();
+        
+        std::cout << "[DEBUG] Inspecting Material. Diffuse: (" 
+                  << diffuse.r() << ", " << diffuse.g() << ", " << diffuse.b() << ", " << alpha << ")" << std::endl;
 
         // Detect transparency
         std::string alphaMode = (alpha < 1.0f) ? "BLEND" : "OPAQUE";
 
         // Texture Check
         osg::Texture2D* tex = dynamic_cast<osg::Texture2D*>(ss->getTextureAttribute(0, osg::StateAttribute::TEXTURE));
-        bool hasTexture = false; // Set to true if texture support is added in future
+        bool hasTexture = false;
+        int textureIndex = -1;
+        
+        if (tex) {
+            std::cout << "[DEBUG]   Texture2D attribute found." << std::endl;
+            if (tex->getImage()) {
+                osg::Image* img = tex->getImage();
+                if (img->valid()) {
+                    hasTexture = true;
+                    std::string imgName = img->getFileName();
+                    if (imgName.empty()) {
+                        std::stringstream ptrSs;
+                        ptrSs << (void*)img;
+                        imgName = "embedded_" + ptrSs.str();
+                    }
+                    std::cout << "[DEBUG]   Image valid. Name: " << imgName 
+                              << " Size: " << img->s() << "x" << img->t() 
+                              << " Format: " << std::hex << img->getPixelFormat() << std::dec << std::endl;
+
+                    // Check Image Cache
+                    int imgIndex = -1;
+                    if (_imageCache.find(imgName) != _imageCache.end()) {
+                        imgIndex = _imageCache[imgName];
+                    } else {
+                        // Create Image
+                        Image gltfImg;
+                        gltfImg.name = imgName;
+                        gltfImg.width = img->s();
+                        gltfImg.height = img->t();
+                        gltfImg.bits = 8;
+                        // Pick MIME type from filename extension so the writer knows how to embed
+                        std::string ext = imgName;
+                        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                        if (ext.size() >= 4 && ext.substr(ext.size() - 4) == ".png") {
+                            gltfImg.mimeType = "image/png";
+                        } else if ((ext.size() >= 4 && ext.substr(ext.size() - 4) == ".jpg") ||
+                                   (ext.size() >= 5 && ext.substr(ext.size() - 5) == ".jpeg")) {
+                            gltfImg.mimeType = "image/jpeg";
+                        } else {
+                            // Default to png to keep viewers happy if extension is missing/odd
+                            gltfImg.mimeType = "image/png";
+                        }
+                        gltfImg.uri = imgName; // helpful for non-binary glTF readers
+                        
+                        GLenum pixelFormat = img->getPixelFormat();
+                        int components = 3; // Default to RGB
+                        if (pixelFormat == GL_RGBA || pixelFormat == GL_BGRA) {
+                            components = 4;
+                        } else if (pixelFormat == GL_RGB || pixelFormat == GL_BGR) {
+                            components = 3;
+                        }
+                        // Handle other specific cases or default to 3 components (RGB) if unknown
+                        gltfImg.component = components;
+                        gltfImg.pixel_type = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+
+                        // Copy data
+                        size_t dataSize = img->getTotalSizeInBytes();
+                        gltfImg.image.resize(dataSize);
+                        if (img->data()) {
+                            memcpy(gltfImg.image.data(), img->data(), dataSize);
+                        }
+
+                        // Handle BGR/BGRA if needed (simple check for common OSG formats)
+                        if (pixelFormat == GL_BGRA) {
+                            // Swap B and R channels
+                            for (size_t i = 0; i < dataSize; i += 4) {
+                                 std::swap(gltfImg.image[i], gltfImg.image[i+2]);
+                            }
+                        } else if (pixelFormat == GL_BGR) {
+                             // Swap B and R channels
+                            for (size_t i = 0; i < dataSize; i += 3) {
+                                 std::swap(gltfImg.image[i], gltfImg.image[i+2]);
+                            }
+                        }
+
+                        imgIndex = _model->images.size();
+                        _model->images.push_back(gltfImg);
+                        _imageCache[imgName] = imgIndex;
+                    }
+                    
+                    // Check Texture Cache
+                    std::string texKey = std::to_string(imgIndex);
+                    if (_textureCache.find(texKey) != _textureCache.end()) {
+                        textureIndex = _textureCache[texKey];
+                    } else {
+                        Texture gltfTex;
+                        gltfTex.source = imgIndex;
+                        gltfTex.sampler = -1; // Default sampler
+                        
+                        textureIndex = _model->textures.size();
+                        _model->textures.push_back(gltfTex);
+                        _textureCache[texKey] = textureIndex;
+                    }
+                } else {
+                     std::cout << "[DEBUG]   Image invalid!" << std::endl;
+                }
+            } else {
+                std::cout << "[DEBUG]   Texture has no image!" << std::endl;
+            }
+        }
+        
         bool hasNormalMap = false; // For tangent generation
 
-        // Material Caching: Include alpha mode in key
+        // Material Caching: Include alpha mode and texture index in key
         std::stringstream ssKey;
         ssKey << std::fixed << std::setprecision(2)
               << diffuse.r() << "_" << diffuse.g() << "_" << diffuse.b() << "_" << alpha
-              << "_" << (hasTexture ? "1" : "0") << "_" << alphaMode;
+              << "_" << (hasTexture ? "1" : "0") << "_" << alphaMode << "_" << textureIndex;
         std::string key = ssKey.str();
 
         if (_materialCache.find(key) != _materialCache.end()) {
@@ -304,9 +417,18 @@ private:
         }
 
         Material glMat;
-        glMat.pbrMetallicRoughness.baseColorFactor = {diffuse.r(), diffuse.g(), diffuse.b(), alpha};
+        if (textureIndex >= 0) {
+            // If a texture is present, set baseColorFactor to white to avoid tinting the texture
+            glMat.pbrMetallicRoughness.baseColorFactor = {1.0, 1.0, 1.0, alpha};
+        } else {
+            glMat.pbrMetallicRoughness.baseColorFactor = {diffuse.r(), diffuse.g(), diffuse.b(), alpha};
+        }
         glMat.doubleSided = true;
         glMat.alphaMode = alphaMode;
+        
+        if (textureIndex >= 0) {
+            glMat.pbrMetallicRoughness.baseColorTexture.index = textureIndex;
+        }
 
         // Set alpha cutoff for BLEND mode
         if (alphaMode == "BLEND") {
@@ -315,10 +437,6 @@ private:
 
         // Name material based on cache size (simple index)
         glMat.name = "Mat_" + std::to_string(_model->materials.size()) + "_" + alphaMode;
-
-        if (hasTexture) {
-            // Placeholder for texture export logic
-        }
 
         int matIdx = _model->materials.size();
         _model->materials.push_back(glMat);
@@ -341,6 +459,19 @@ private:
         osg::StateSet* ss = geom->getStateSet();
         if (!ss && parentNode) ss = parentNode->getStateSet();
         MaterialInfo matInfo = getOrCreateMaterial(ss);
+
+        // Debug geometry info
+        // std::cout << "[DEBUG] Processing Geometry. Material Idx: " << matInfo.index 
+        //           << " HasTexture: " << matInfo.hasTexture 
+        //           << " Verts: " << verts->size() << std::endl;
+        
+        if (cols && !cols->empty()) {
+            osg::Vec4 c = (*cols)[0];
+            std::cout << "[DEBUG]   Vertex Color (First): (" 
+                      << c.r() << ", " << c.g() << ", " << c.b() << ", " << c.a() << ")" << std::endl;
+        } else {
+            std::cout << "[DEBUG]   No Vertex Colors found." << std::endl;
+        }
 
         osg::Matrix currentMat = getCurrentMatrix();
         bool hasTransform = !_matrixStack.empty();
@@ -768,40 +899,25 @@ int main(int argc, char** argv) {
     }
     std::cout << "RoadManager initialized. Roads: " << odr->GetNumOfRoads() << std::endl;
 
-    // 2. Compute Robust Origin (Center of Bounding Box)
+    // 2. Compute Origin (First Geometry Element)
     osg::Vec3d origin(0,0,0);
     {
-        double minX = std::numeric_limits<double>::max();
-        double minY = std::numeric_limits<double>::max();
-        double maxX = std::numeric_limits<double>::lowest();
-        double maxY = std::numeric_limits<double>::lowest();
-        int validPoints = 0;
-
-        for(int i=0; i < odr->GetNumOfRoads(); ++i) {
-            roadmanager::Road* r = odr->GetRoadByIdx(i);
-            if(!r) continue;
-            
-            // Check start and end of road
-            double s_vals[] = {0.0, r->GetLength()};
-            for(double s : s_vals) {
-                 roadmanager::Position pos(r->GetId(), s, 0.0);
-                 pos.EvaluateZHPR();
-                 double x = pos.GetX();
-                 double y = pos.GetY();
-                 if (x < minX) minX = x;
-                 if (y < minY) minY = y;
-                 if (x > maxX) maxX = x;
-                 if (y > maxY) maxY = y;
-                 validPoints++;
+        // Use the first road's first point as the origin for deterministic reference
+        if (odr->GetNumOfRoads() > 0) {
+            roadmanager::Road* r = odr->GetRoadByIdx(0);
+            if (r) {
+                roadmanager::Position pos(r->GetId(), 0.0, 0.0);
+                pos.EvaluateZHPR();
+                origin.set(pos.GetX(), pos.GetY(), pos.GetZ());
+                std::cout << "[export] Using First Geometry Element as Origin: "
+                          << origin.x() << ", " << origin.y() << ", " << origin.z() << std::endl;
+            } else {
+                auto geoOffset = odr->GetGeoOffset();
+                origin.set(geoOffset.x_, geoOffset.y_, geoOffset.z_);
             }
-        }
-        
-        if (validPoints > 0) {
-            origin.set((minX + maxX) * 0.5, (minY + maxY) * 0.5, 0.0);
-            std::cout << "[export] Computed Network Center: " << origin.x() << ", " << origin.y() << std::endl;
         } else {
-             auto geoOffset = odr->GetGeoOffset();
-             origin.set(geoOffset.x_, geoOffset.y_, geoOffset.z_);
+            auto geoOffset = odr->GetGeoOffset();
+            origin.set(geoOffset.x_, geoOffset.y_, geoOffset.z_);
         }
     }
 
@@ -856,11 +972,11 @@ int main(int argc, char** argv) {
 
     Node rootTransformNode;
     rootTransformNode.name = "SceneRoot_Zup_to_Yup_Transform";
-    // x->x, y->z, z->-y
+    // Rotate +90 deg around X to go from OSG Z-up to glTF Y-up without flipping
     rootTransformNode.matrix = {
         1, 0, 0, 0,
-        0, 0, 1, 0,
-        0,-1, 0, 0,
+        0, 0,-1, 0,
+        0, 1, 0, 0,
         0, 0, 0, 1
     };
     
